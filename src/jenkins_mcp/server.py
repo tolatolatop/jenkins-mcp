@@ -504,5 +504,10 @@ def fetch_build_artifact(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
+def main() -> None:
+    """CLI entry point for the Jenkins MCP Server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

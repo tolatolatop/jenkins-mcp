@@ -12,6 +12,9 @@ dependencies = [
     "python-jenkins>=1.8.0",
 ]
 
+[project.scripts]
+jenkins-mcp = "jenkins_mcp.server:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -19,6 +22,9 @@ dev = [
 
 [tool.poetry]
 packages = [{include = "jenkins_mcp", from = "src"}]
+
+[tool.poetry.scripts]
+jenkins-mcp = "jenkins_mcp.server:main"
 
 
 [build-system]
