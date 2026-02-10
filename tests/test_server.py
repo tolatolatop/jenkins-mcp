@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import jenkins
@@ -14,8 +15,10 @@ from jenkins_mcp.server import (
     get_job_parameters as _get_job_parameters_tool,
     get_job_status as _get_job_status_tool,
     list_build_artifacts as _list_build_artifacts_tool,
+    list_triggered_jobs as _list_triggered_jobs_tool,
     trigger_job as _trigger_job_tool,
 )
+from jenkins_mcp.trigger_store import TriggerStore
 
 # @mcp.tool wraps functions as FunctionTool objects; access the
 # underlying plain function via the `.fn` attribute for direct testing.
@@ -26,6 +29,7 @@ get_build_log = _get_build_log_tool.fn
 cancel_build = _cancel_build_tool.fn
 list_build_artifacts = _list_build_artifacts_tool.fn
 fetch_build_artifact = _fetch_build_artifact_tool.fn
+list_triggered_jobs = _list_triggered_jobs_tool.fn
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +44,23 @@ def mock_client():
         yield client
 
 
+@pytest.fixture
+def tmp_store(tmp_path: Path):
+    """Provide a TriggerStore backed by a temp file and patch get_store."""
+    store = TriggerStore(path=tmp_path / "triggered_jobs.json")
+    with patch("jenkins_mcp.server.get_store", return_value=store):
+        yield store
+
+
 # ---------------------------------------------------------------------------
 # trigger_job
 # ---------------------------------------------------------------------------
 class TestTriggerJob:
+    @pytest.fixture(autouse=True)
+    def _with_store(self, tmp_store):
+        """Every trigger_job test gets a clean temporary store."""
+        self.store = tmp_store
+
     def test_trigger_success_with_build_number(self, mock_client):
         """Trigger a job and successfully resolve the build number."""
         mock_client.build_job.return_value = 101  # queue_id
@@ -105,6 +122,38 @@ class TestTriggerJob:
         mock_client.build_job.assert_called_once_with(
             "simple-job", parameters=None
         )
+
+    def test_trigger_persists_record(self, mock_client):
+        """Triggered job is saved to the store."""
+        mock_client.build_job.return_value = 300
+        mock_client.get_queue_item.return_value = {
+            "executable": {"number": 15}
+        }
+
+        with patch("jenkins_mcp.server.time.sleep"):
+            trigger_job("persist-job", parameters={"X": "1"})
+
+        records = self.store.list_all()
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["job_name"] == "persist-job"
+        assert rec["parameters"] == {"X": "1"}
+        assert rec["build_number"] == 15
+        assert rec["queue_id"] == 300
+        assert rec["status"] == "RUNNING"
+        assert "trigger_time" in rec
+
+    def test_trigger_persists_queued_record(self, mock_client):
+        """Record marked QUEUED when build number not resolved."""
+        mock_client.build_job.return_value = 301
+        mock_client.get_queue_item.return_value = {"executable": None}
+
+        with patch("jenkins_mcp.server.time.sleep"):
+            trigger_job("queued-job")
+
+        records = self.store.list_all()
+        assert records[0]["status"] == "QUEUED"
+        assert records[0]["build_number"] is None
 
     def test_trigger_jenkins_exception(self, mock_client):
         """build_job raises JenkinsException."""
@@ -639,3 +688,196 @@ class TestFetchBuildArtifact:
         assert result["success"] is True
         assert result["file_name"] == "index.html"
         assert result["artifact_path"] == "a/b/c/index.html"
+
+
+# ---------------------------------------------------------------------------
+# TriggerStore (unit tests)
+# ---------------------------------------------------------------------------
+class TestTriggerStore:
+    def test_add_and_list(self, tmp_path: Path):
+        store = TriggerStore(path=tmp_path / "store.json")
+        store.add(job_name="j1", parameters=None, queue_id=1, build_number=10)
+        store.add(job_name="j2", parameters={"A": "1"}, queue_id=2, build_number=None)
+
+        records = store.list_all()
+        assert len(records) == 2
+        # newest first
+        assert records[0]["job_name"] == "j2"
+        assert records[1]["job_name"] == "j1"
+
+    def test_update_record(self, tmp_path: Path):
+        store = TriggerStore(path=tmp_path / "store.json")
+        store.add(job_name="j1", parameters=None, queue_id=100, build_number=None)
+
+        store.update_record(100, build_number=5, status="SUCCESS")
+
+        rec = store.list_all()[0]
+        assert rec["build_number"] == 5
+        assert rec["status"] == "SUCCESS"
+
+    def test_clear(self, tmp_path: Path):
+        store = TriggerStore(path=tmp_path / "store.json")
+        store.add(job_name="j1", parameters=None, queue_id=1, build_number=1)
+        store.clear()
+        assert store.list_all() == []
+
+    def test_persistence_across_instances(self, tmp_path: Path):
+        path = tmp_path / "store.json"
+        store1 = TriggerStore(path=path)
+        store1.add(job_name="j1", parameters=None, queue_id=1, build_number=1)
+
+        # New instance reads from same file
+        store2 = TriggerStore(path=path)
+        assert len(store2.list_all()) == 1
+
+    def test_empty_file(self, tmp_path: Path):
+        path = tmp_path / "store.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        store = TriggerStore(path=path)
+        assert store.list_all() == []
+
+    def test_corrupt_file(self, tmp_path: Path):
+        path = tmp_path / "store.json"
+        path.write_text("{not valid json")
+        store = TriggerStore(path=path)
+        assert store.list_all() == []
+
+
+# ---------------------------------------------------------------------------
+# list_triggered_jobs
+# ---------------------------------------------------------------------------
+class TestListTriggeredJobs:
+    def test_empty_store(self, mock_client, tmp_store):
+        """No records yet."""
+        result = list_triggered_jobs()
+
+        assert result["success"] is True
+        assert result["total"] == 0
+        assert "No jobs" in result["message"]
+
+    def test_sync_running_to_success(self, mock_client, tmp_store):
+        """A RUNNING job is updated to SUCCESS on query."""
+        tmp_store.add(
+            job_name="my-job", parameters=None, queue_id=10, build_number=5
+        )
+        mock_client.get_build_info.return_value = {
+            "building": False,
+            "result": "SUCCESS",
+        }
+
+        result = list_triggered_jobs()
+
+        assert result["success"] is True
+        assert result["total"] == 1
+        assert result["records"][0]["status"] == "SUCCESS"
+        # Store is also updated persistently
+        assert tmp_store.list_all()[0]["status"] == "SUCCESS"
+
+    def test_sync_running_to_failure(self, mock_client, tmp_store):
+        """A RUNNING job is updated to FAILURE."""
+        tmp_store.add(
+            job_name="fail-job", parameters=None, queue_id=20, build_number=3
+        )
+        mock_client.get_build_info.return_value = {
+            "building": False,
+            "result": "FAILURE",
+        }
+
+        result = list_triggered_jobs()
+
+        assert result["records"][0]["status"] == "FAILURE"
+
+    def test_sync_still_running(self, mock_client, tmp_store):
+        """A job that is still building stays RUNNING."""
+        tmp_store.add(
+            job_name="busy-job", parameters=None, queue_id=30, build_number=7
+        )
+        mock_client.get_build_info.return_value = {
+            "building": True,
+            "result": None,
+        }
+
+        result = list_triggered_jobs()
+
+        assert result["records"][0]["status"] == "RUNNING"
+
+    def test_sync_queued_resolves_build_number(self, mock_client, tmp_store):
+        """A QUEUED job gets its build_number resolved and status synced."""
+        tmp_store.add(
+            job_name="q-job", parameters={"K": "V"}, queue_id=40, build_number=None
+        )
+        mock_client.get_queue_item.return_value = {
+            "executable": {"number": 99}
+        }
+        mock_client.get_build_info.return_value = {
+            "building": True,
+            "result": None,
+        }
+
+        result = list_triggered_jobs()
+
+        rec = result["records"][0]
+        assert rec["build_number"] == 99
+        assert rec["status"] == "RUNNING"
+
+    def test_sync_queued_still_no_build(self, mock_client, tmp_store):
+        """QUEUED job where queue item still has no executable."""
+        tmp_store.add(
+            job_name="wait-job", parameters=None, queue_id=50, build_number=None
+        )
+        mock_client.get_queue_item.return_value = {"executable": None}
+
+        result = list_triggered_jobs()
+
+        rec = result["records"][0]
+        assert rec["build_number"] is None
+        assert rec["status"] == "QUEUED"
+
+    def test_terminal_states_not_re_queried(self, mock_client, tmp_store):
+        """Jobs in terminal states (SUCCESS/FAILURE/ABORTED) are not queried."""
+        tmp_store.add(
+            job_name="done-job", parameters=None, queue_id=60, build_number=1
+        )
+        tmp_store.update_record(60, status="SUCCESS")
+
+        result = list_triggered_jobs()
+
+        assert result["records"][0]["status"] == "SUCCESS"
+        mock_client.get_build_info.assert_not_called()
+
+    def test_multiple_records(self, mock_client, tmp_store):
+        """Multiple records with mixed states."""
+        tmp_store.add(
+            job_name="job-a", parameters=None, queue_id=1, build_number=1
+        )
+        tmp_store.update_record(1, status="SUCCESS")
+        tmp_store.add(
+            job_name="job-b", parameters=None, queue_id=2, build_number=2
+        )
+        mock_client.get_build_info.return_value = {
+            "building": False,
+            "result": "FAILURE",
+        }
+
+        result = list_triggered_jobs()
+
+        assert result["total"] == 2
+        # newest first
+        assert result["records"][0]["job_name"] == "job-b"
+        assert result["records"][0]["status"] == "FAILURE"
+        assert result["records"][1]["job_name"] == "job-a"
+        assert result["records"][1]["status"] == "SUCCESS"
+
+    def test_jenkins_error_during_sync_is_graceful(self, mock_client, tmp_store):
+        """If Jenkins errors during sync, the record keeps its old status."""
+        tmp_store.add(
+            job_name="err-job", parameters=None, queue_id=70, build_number=8
+        )
+        mock_client.get_build_info.side_effect = jenkins.JenkinsException("timeout")
+
+        result = list_triggered_jobs()
+
+        # Still returns the records, status unchanged
+        assert result["success"] is True
+        assert result["records"][0]["status"] == "RUNNING"

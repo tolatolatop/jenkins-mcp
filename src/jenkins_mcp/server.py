@@ -12,6 +12,7 @@ import requests
 from fastmcp import FastMCP
 
 from jenkins_mcp.jenkins_client import get_client
+from jenkins_mcp.trigger_store import get_store
 
 mcp = FastMCP("Jenkins MCP Server")
 
@@ -52,6 +53,15 @@ def trigger_job(job_name: str, parameters: dict[str, Any] | None = None) -> dict
             except jenkins.JenkinsException:
                 # Queue item may not be ready yet, keep polling
                 continue
+
+        # Persist trigger record
+        store = get_store()
+        store.add(
+            job_name=job_name,
+            parameters=parameters,
+            queue_id=queue_id,
+            build_number=build_number,
+        )
 
         result: dict[str, Any] = {
             "success": True,
@@ -287,7 +297,79 @@ def cancel_build(job_name: str, build_number: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Tool 6: list_build_artifacts
+# Tool 6: list_triggered_jobs
+# ---------------------------------------------------------------------------
+@mcp.tool
+def list_triggered_jobs() -> dict[str, Any]:
+    """List all jobs triggered through this MCP server.
+
+    Each record includes the job name, trigger parameters, trigger time and
+    current status.  Every call synchronises the status of unfinished jobs
+    by querying Jenkins, so the returned data is always up-to-date.
+
+    Returns:
+        A dict containing the list of triggered job records (newest first).
+    """
+    try:
+        store = get_store()
+        records = store.list_all()
+
+        if not records:
+            return {
+                "success": True,
+                "total": 0,
+                "records": [],
+                "message": "No jobs have been triggered through this MCP server yet.",
+            }
+
+        # Synchronise status for unfinished jobs
+        client = get_client()
+        for rec in records:
+            status = rec.get("status", "")
+            if status in ("SUCCESS", "FAILURE", "ABORTED"):
+                continue  # terminal state — skip
+
+            queue_id = rec.get("queue_id")
+            build_number = rec.get("build_number")
+
+            # If we don't have a build number yet, try to resolve it
+            if build_number is None and queue_id is not None:
+                try:
+                    queue_item = client.get_queue_item(queue_id)
+                    executable = queue_item.get("executable")
+                    if executable and executable.get("number"):
+                        build_number = executable["number"]
+                        rec["build_number"] = build_number
+                        store.update_record(queue_id, build_number=build_number)
+                except jenkins.JenkinsException:
+                    pass
+
+            # If we now have a build number, query its status
+            if build_number is not None:
+                try:
+                    build_info = client.get_build_info(rec["job_name"], build_number)
+                    if build_info.get("building", False):
+                        new_status = "RUNNING"
+                    else:
+                        new_status = build_info.get("result") or "UNKNOWN"
+                    rec["status"] = new_status
+                    store.update_record(queue_id, status=new_status)
+                except jenkins.JenkinsException:
+                    pass
+
+        return {
+            "success": True,
+            "total": len(records),
+            "records": records,
+        }
+    except jenkins.JenkinsException as e:
+        return _format_error(e)
+    except ValueError as e:
+        return _format_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: list_build_artifacts
 # ---------------------------------------------------------------------------
 @mcp.tool
 def list_build_artifacts(
@@ -349,7 +431,7 @@ def list_build_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Tool 7: fetch_build_artifact
+# Tool 8: fetch_build_artifact
 # ---------------------------------------------------------------------------
 @mcp.tool
 def fetch_build_artifact(
