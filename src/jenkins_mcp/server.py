@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -35,12 +36,38 @@ def trigger_job(job_name: str, parameters: dict[str, Any] | None = None) -> dict
     try:
         client = get_client()
         queue_id = client.build_job(job_name, parameters=parameters)
-        return {
+
+        # Poll the queue for up to 10 seconds to resolve the build number
+        build_number = None
+        for _ in range(10):
+            time.sleep(1)
+            try:
+                queue_item = client.get_queue_item(queue_id)
+                executable = queue_item.get("executable")
+                if executable and executable.get("number"):
+                    build_number = executable["number"]
+                    break
+            except jenkins.JenkinsException:
+                # Queue item may not be ready yet, keep polling
+                continue
+
+        result: dict[str, Any] = {
             "success": True,
             "job_name": job_name,
             "queue_id": queue_id,
-            "message": f"Job '{job_name}' has been triggered. Queue ID: {queue_id}",
         }
+        if build_number is not None:
+            result["build_number"] = build_number
+            result["message"] = (
+                f"Job '{job_name}' has been triggered. "
+                f"Build number: #{build_number}"
+            )
+        else:
+            result["message"] = (
+                f"Job '{job_name}' has been triggered (queue ID: {queue_id}). "
+                f"Build number not yet available — the job may still be waiting in queue."
+            )
+        return result
     except jenkins.JenkinsException as e:
         return _format_error(e)
     except ValueError as e:
