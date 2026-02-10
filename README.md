@@ -1,0 +1,109 @@
+# Jenkins MCP Server
+
+一个基于 [FastMCP](https://gofastmcp.com/) 构建的 MCP 服务，用于通过 MCP 协议管理 Jenkins 任务。
+
+## 功能
+
+| 工具 | 说明 |
+|------|------|
+| `trigger_job` | 触发 Jenkins 任务构建，支持传入参数 |
+| `get_job_parameters` | 获取任务的参数定义列表（名称、类型、默认值、描述） |
+| `get_job_status` | 查看任务构建状态（支持指定构建号或查看最新构建） |
+| `get_build_log` | 分页获取构建控制台日志（支持从头部或末尾读取） |
+| `cancel_build` | 取消正在运行的构建 |
+
+## 安装
+
+```bash
+# 使用 uv
+uv sync
+
+# 或使用 pip
+pip install -e .
+```
+
+## 环境变量配置
+
+| 变量 | 说明 | 必填 |
+|------|------|------|
+| `JENKINS_URL` | Jenkins 服务地址，例如 `http://jenkins.example.com:8080` | 是 |
+| `JENKINS_USERNAME` | Jenkins 用户名 | 否 |
+| `JENKINS_API_TOKEN` | Jenkins API Token | 否 |
+
+## 运行
+
+```bash
+# 设置环境变量
+export JENKINS_URL="http://jenkins.example.com:8080"
+export JENKINS_USERNAME="your-username"
+export JENKINS_API_TOKEN="your-api-token"
+
+# 运行 MCP 服务（stdio 模式）
+uv run python -m jenkins_mcp.server
+
+# 或使用 fastmcp CLI
+uv run fastmcp run src/jenkins_mcp/server.py
+```
+
+## MCP 客户端配置示例
+
+在 MCP 客户端（如 Cursor、Claude Desktop 等）中添加以下配置：
+
+```json
+{
+  "mcpServers": {
+    "jenkins": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/jenkins-mcp", "python", "-m", "jenkins_mcp.server"],
+      "env": {
+        "JENKINS_URL": "http://jenkins.example.com:8080",
+        "JENKINS_USERNAME": "your-username",
+        "JENKINS_API_TOKEN": "your-api-token"
+      }
+    }
+  }
+}
+```
+
+## 工具使用示例
+
+### 触发任务
+
+```
+trigger_job(job_name="my-project/main", parameters={"BRANCH": "develop", "DEPLOY": "true"})
+```
+
+### 获取任务参数
+
+```
+get_job_parameters(job_name="my-project/main")
+```
+
+### 查看构建状态
+
+```
+# 查看最新构建
+get_job_status(job_name="my-project/main")
+
+# 查看指定构建
+get_job_status(job_name="my-project/main", build_number=42)
+```
+
+### 获取构建日志
+
+```
+# 从头部获取前 100 行
+get_build_log(job_name="my-project/main", build_number=42)
+
+# 获取最后 50 行
+get_build_log(job_name="my-project/main", build_number=42, max_lines=50, from_end=True)
+
+# 从末尾跳过 50 行后再取 100 行（向上翻页）
+get_build_log(job_name="my-project/main", build_number=42, start_line=50, max_lines=100, from_end=True)
+```
+
+### 取消构建
+
+```
+cancel_build(job_name="my-project/main", build_number=42)
+```
