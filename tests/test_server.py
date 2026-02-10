@@ -9,9 +9,11 @@ import pytest
 
 from jenkins_mcp.server import (
     cancel_build as _cancel_build_tool,
+    fetch_build_artifact as _fetch_build_artifact_tool,
     get_build_log as _get_build_log_tool,
     get_job_parameters as _get_job_parameters_tool,
     get_job_status as _get_job_status_tool,
+    list_build_artifacts as _list_build_artifacts_tool,
     trigger_job as _trigger_job_tool,
 )
 
@@ -22,6 +24,8 @@ get_job_parameters = _get_job_parameters_tool.fn
 get_job_status = _get_job_status_tool.fn
 get_build_log = _get_build_log_tool.fn
 cancel_build = _cancel_build_tool.fn
+list_build_artifacts = _list_build_artifacts_tool.fn
+fetch_build_artifact = _fetch_build_artifact_tool.fn
 
 
 # ---------------------------------------------------------------------------
@@ -431,3 +435,207 @@ class TestCancelBuild:
 
         assert result["error"] is True
         assert "build not running" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# list_build_artifacts
+# ---------------------------------------------------------------------------
+class TestListBuildArtifacts:
+    def test_list_with_artifacts(self, mock_client):
+        """Build with multiple artifacts."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/5/",
+            "artifacts": [
+                {
+                    "displayPath": "app.jar",
+                    "fileName": "app.jar",
+                    "relativePath": "target/app.jar",
+                },
+                {
+                    "displayPath": "report.html",
+                    "fileName": "report.html",
+                    "relativePath": "reports/report.html",
+                },
+            ],
+        }
+
+        result = list_build_artifacts("my-job", build_number=5)
+
+        assert result["success"] is True
+        assert result["build_number"] == 5
+        assert result["artifact_count"] == 2
+        assert result["artifacts"][0]["file_name"] == "app.jar"
+        assert result["artifacts"][0]["relative_path"] == "target/app.jar"
+        assert result["artifacts"][0]["download_url"] == (
+            "http://j/job/my-job/5/artifact/target/app.jar"
+        )
+        assert result["artifacts"][1]["file_name"] == "report.html"
+
+    def test_list_no_artifacts(self, mock_client):
+        """Build with no artifacts."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/3/",
+            "artifacts": [],
+        }
+
+        result = list_build_artifacts("my-job", build_number=3)
+
+        assert result["success"] is True
+        assert result["artifact_count"] == 0
+        assert result["artifacts"] == []
+
+    def test_list_latest_build(self, mock_client):
+        """No build_number provided — use latest."""
+        mock_client.get_job_info.return_value = {
+            "lastBuild": {"number": 10}
+        }
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/10/",
+            "artifacts": [
+                {
+                    "displayPath": "out.log",
+                    "fileName": "out.log",
+                    "relativePath": "out.log",
+                }
+            ],
+        }
+
+        result = list_build_artifacts("my-job")
+
+        assert result["success"] is True
+        assert result["build_number"] == 10
+        assert result["artifact_count"] == 1
+
+    def test_list_no_builds(self, mock_client):
+        """Job has no builds at all."""
+        mock_client.get_job_info.return_value = {"lastBuild": None}
+
+        result = list_build_artifacts("empty-job")
+
+        assert result["success"] is True
+        assert "No builds found" in result["message"]
+
+    def test_list_jenkins_exception(self, mock_client):
+        mock_client.get_build_info.side_effect = jenkins.JenkinsException("error")
+
+        result = list_build_artifacts("bad-job", build_number=1)
+
+        assert result["error"] is True
+
+
+# ---------------------------------------------------------------------------
+# fetch_build_artifact
+# ---------------------------------------------------------------------------
+class TestFetchBuildArtifact:
+    def test_fetch_text_artifact(self, mock_client):
+        """Download a text artifact."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/5/",
+        }
+        mock_response = MagicMock()
+        mock_response.headers = {"Content-Type": "text/plain; charset=utf-8"}
+        mock_response.text = "Hello, world!\nLine 2\n"
+        mock_response.content = b"Hello, world!\nLine 2\n"
+        mock_client.jenkins_request.return_value = mock_response
+
+        result = fetch_build_artifact("my-job", 5, "output/result.txt")
+
+        assert result["success"] is True
+        assert result["encoding"] == "text"
+        assert result["content"] == "Hello, world!\nLine 2\n"
+        assert result["file_name"] == "result.txt"
+        assert result["size_bytes"] == len(b"Hello, world!\nLine 2\n")
+
+    def test_fetch_json_artifact(self, mock_client):
+        """Download a JSON artifact (treated as text)."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/5/",
+        }
+        json_body = '{"status": "ok"}'
+        mock_response = MagicMock()
+        mock_response.headers = {"Content-Type": "application/json"}
+        mock_response.text = json_body
+        mock_response.content = json_body.encode()
+        mock_client.jenkins_request.return_value = mock_response
+
+        result = fetch_build_artifact("my-job", 5, "data.json")
+
+        assert result["success"] is True
+        assert result["encoding"] == "text"
+        assert result["content"] == json_body
+
+    def test_fetch_xml_artifact(self, mock_client):
+        """Download an XML artifact (treated as text)."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/5/",
+        }
+        xml_body = "<root><item/></root>"
+        mock_response = MagicMock()
+        mock_response.headers = {"Content-Type": "application/xml"}
+        mock_response.text = xml_body
+        mock_response.content = xml_body.encode()
+        mock_client.jenkins_request.return_value = mock_response
+
+        result = fetch_build_artifact("my-job", 5, "report.xml")
+
+        assert result["encoding"] == "text"
+
+    def test_fetch_binary_artifact(self, mock_client):
+        """Download a binary artifact — returns base64."""
+        import base64
+
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/5/",
+        }
+        binary_data = bytes(range(256))
+        mock_response = MagicMock()
+        mock_response.headers = {"Content-Type": "application/octet-stream"}
+        mock_response.content = binary_data
+        mock_client.jenkins_request.return_value = mock_response
+
+        result = fetch_build_artifact("my-job", 5, "build/app.jar")
+
+        assert result["success"] is True
+        assert result["encoding"] == "base64"
+        assert result["file_name"] == "app.jar"
+        assert result["size_bytes"] == 256
+        # Verify we can decode it back
+        decoded = base64.b64decode(result["content"])
+        assert decoded == binary_data
+
+    def test_fetch_no_build_url(self, mock_client):
+        """Build info has no URL — returns error."""
+        mock_client.get_build_info.return_value = {"url": ""}
+
+        result = fetch_build_artifact("my-job", 5, "any.txt")
+
+        assert result["error"] is True
+        assert "Cannot determine build URL" in result["message"]
+
+    def test_fetch_jenkins_exception(self, mock_client):
+        mock_client.get_build_info.side_effect = jenkins.JenkinsException(
+            "not found"
+        )
+
+        result = fetch_build_artifact("bad-job", 1, "any.txt")
+
+        assert result["error"] is True
+
+    def test_fetch_artifact_nested_path(self, mock_client):
+        """Artifact with deeply nested relative path."""
+        mock_client.get_build_info.return_value = {
+            "url": "http://j/job/my-job/1/",
+        }
+        mock_response = MagicMock()
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.text = "<html></html>"
+        mock_response.content = b"<html></html>"
+        mock_client.jenkins_request.return_value = mock_response
+
+        result = fetch_build_artifact(
+            "my-job", 1, "a/b/c/index.html"
+        )
+
+        assert result["success"] is True
+        assert result["file_name"] == "index.html"
+        assert result["artifact_path"] == "a/b/c/index.html"

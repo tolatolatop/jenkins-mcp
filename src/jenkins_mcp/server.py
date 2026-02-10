@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import jenkins
+import requests
 from fastmcp import FastMCP
 
 from jenkins_mcp.jenkins_client import get_client
@@ -278,6 +280,139 @@ def cancel_build(job_name: str, build_number: int) -> dict[str, Any]:
             "build_number": build_number,
             "message": f"Build #{build_number} of '{job_name}' has been cancelled.",
         }
+    except jenkins.JenkinsException as e:
+        return _format_error(e)
+    except ValueError as e:
+        return _format_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: list_build_artifacts
+# ---------------------------------------------------------------------------
+@mcp.tool
+def list_build_artifacts(
+    job_name: str, build_number: int | None = None
+) -> dict[str, Any]:
+    """List artifacts produced by a Jenkins build.
+
+    Args:
+        job_name: Full name of the Jenkins job.
+        build_number: The build number to query. If not provided, the latest
+            build is used.
+
+    Returns:
+        A dict containing a list of artifacts with file name, relative path
+        and download URL for each artifact.
+    """
+    try:
+        client = get_client()
+
+        if build_number is None:
+            job_info = client.get_job_info(job_name)
+            last_build = job_info.get("lastBuild")
+            if last_build is None:
+                return {
+                    "success": True,
+                    "job_name": job_name,
+                    "message": "No builds found for this job.",
+                }
+            build_number = last_build["number"]
+
+        build_info = client.get_build_info(job_name, build_number)
+        build_url = build_info.get("url", "")
+        raw_artifacts = build_info.get("artifacts", [])
+
+        artifacts = []
+        for a in raw_artifacts:
+            relative_path = a.get("relativePath", "")
+            artifacts.append(
+                {
+                    "file_name": a.get("fileName", ""),
+                    "relative_path": relative_path,
+                    "download_url": f"{build_url}artifact/{relative_path}"
+                    if build_url
+                    else "",
+                }
+            )
+
+        return {
+            "success": True,
+            "job_name": job_name,
+            "build_number": build_number,
+            "artifact_count": len(artifacts),
+            "artifacts": artifacts,
+        }
+    except jenkins.JenkinsException as e:
+        return _format_error(e)
+    except ValueError as e:
+        return _format_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: fetch_build_artifact
+# ---------------------------------------------------------------------------
+@mcp.tool
+def fetch_build_artifact(
+    job_name: str,
+    build_number: int,
+    artifact_path: str,
+) -> dict[str, Any]:
+    """Fetch (download) a specific artifact from a Jenkins build.
+
+    For text files the content is returned directly. For binary files the
+    content is returned as a base64-encoded string.
+
+    Args:
+        job_name: Full name of the Jenkins job.
+        build_number: The build number that produced the artifact.
+        artifact_path: The relative path of the artifact (as shown by
+            list_build_artifacts).
+
+    Returns:
+        A dict containing the artifact content, encoding type ('text' or
+        'base64'), and file name.
+    """
+    try:
+        client = get_client()
+        build_info = client.get_build_info(job_name, build_number)
+        build_url = build_info.get("url", "")
+
+        if not build_url:
+            return _format_error(
+                RuntimeError("Cannot determine build URL from build info.")
+            )
+
+        artifact_url = f"{build_url}artifact/{artifact_path}"
+
+        response = client.jenkins_request(
+            requests.Request("GET", artifact_url)
+        )
+
+        content_type = response.headers.get("Content-Type", "")
+        is_text = content_type.startswith("text/") or "json" in content_type or "xml" in content_type
+
+        if is_text:
+            return {
+                "success": True,
+                "job_name": job_name,
+                "build_number": build_number,
+                "artifact_path": artifact_path,
+                "file_name": artifact_path.rsplit("/", 1)[-1],
+                "encoding": "text",
+                "content": response.text,
+                "size_bytes": len(response.content),
+            }
+        else:
+            return {
+                "success": True,
+                "job_name": job_name,
+                "build_number": build_number,
+                "artifact_path": artifact_path,
+                "file_name": artifact_path.rsplit("/", 1)[-1],
+                "encoding": "base64",
+                "content": base64.b64encode(response.content).decode("ascii"),
+                "size_bytes": len(response.content),
+            }
     except jenkins.JenkinsException as e:
         return _format_error(e)
     except ValueError as e:
